@@ -33,6 +33,7 @@ class DatabaseFactory(private val config: AppConfig.DbConfig) {
             SchemaUtils.createMissingTablesAndColumns(
                 StoryboardEvents, Outbox, StoryboardHead, SegmentProjection,
                 AnalysisProjection, ProcessedVersion, ProcessedEvent, DeadLetter, ImportJobs,
+                PendingEvents, ImportSegments, ReplayAudit,
             )
         }
     }

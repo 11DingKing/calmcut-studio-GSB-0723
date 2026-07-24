@@ -27,7 +27,7 @@ class IntegrityViolationException(val violations: List<String>) :
  * [StoryboardHead], and validates knowledge-point integrity. It must be called
  * inside a [DatabaseFactory.dbQuery] transaction.
  */
-class EventStore(private val eventsTopic: String) {
+class EventStore(private val eventsTopic: String, private val db: DatabaseFactory? = null) {
 
     /**
      * Appends [event] at [expectedVersion] (the caller's last-seen head version).
@@ -98,4 +98,10 @@ class EventStore(private val eventsTopic: String) {
     /** Rebuilds authoritative state by folding the persisted log from zero. */
     fun rebuildState(storyboardId: String): StoryboardState =
         StoryboardProjector.rebuild(storyboardId, readLog(storyboardId))
+
+    /** Reads the ordered log in its own transaction (for callers outside a tx). */
+    suspend fun readLogSuspending(storyboardId: String): List<StoryboardEvent> {
+        val factory = db ?: error("EventStore constructed without a DatabaseFactory")
+        return factory.dbQuery { readLog(storyboardId) }
+    }
 }

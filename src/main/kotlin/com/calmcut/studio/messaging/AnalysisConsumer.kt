@@ -19,8 +19,11 @@ import org.slf4j.LoggerFactory
 /**
  * Consumes storyboard events from Kafka/Redpanda and feeds them to the
  * [IdempotentProcessor]. Offsets are committed only after a poll batch is fully
- * processed; combined with idempotent processing this yields safe at-least-once
- * semantics across worker crashes.
+ * handled. This is safe because [IdempotentProcessor.process] durably persists
+ * every record before returning — an out-of-order event is written to the
+ * `pending_event` table and an in-order event is applied atomically — so a crash
+ * after commit never loses a buffered event, and a crash before commit only
+ * causes idempotent redelivery.
  */
 class AnalysisConsumer(
     private val kafka: AppConfig.KafkaConfig,

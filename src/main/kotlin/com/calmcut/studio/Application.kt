@@ -7,9 +7,7 @@ import com.calmcut.studio.api.StoryboardWriteService
 import com.calmcut.studio.api.storyboardRoutes
 import com.calmcut.studio.config.AppConfig
 import com.calmcut.studio.db.DatabaseFactory
-import com.calmcut.studio.db.DbDeadLetterSink
-import com.calmcut.studio.db.DbIdempotencyChecker
-import com.calmcut.studio.db.DbProjectionStore
+import com.calmcut.studio.db.DbWorkerRepository
 import com.calmcut.studio.db.EventStore
 import com.calmcut.studio.db.IntegrityViolationException
 import com.calmcut.studio.db.KafkaResultPublisher
@@ -19,6 +17,7 @@ import com.calmcut.studio.messaging.AnalysisConsumer
 import com.calmcut.studio.messaging.KafkaEventProducer
 import com.calmcut.studio.messaging.OutboxPublisher
 import com.calmcut.studio.worker.IdempotentProcessor
+import com.calmcut.studio.worker.RebuildService
 import io.ktor.http.HttpStatusCode
 import io.ktor.serialization.kotlinx.json.json
 import io.ktor.server.application.Application
@@ -45,15 +44,14 @@ fun Application.module() {
     )
 
     val db = DatabaseFactory(appConfig.db).apply { connect() }
-    val eventStore = EventStore(appConfig.kafka.eventsTopic)
+    val eventStore = EventStore(appConfig.kafka.eventsTopic, db)
     val producer = KafkaEventProducer(appConfig.kafka)
     val analyzer = RiskAnalyzer(analysisSettings)
 
-    val projections = DbProjectionStore(db, appConfig.kafka.eventsTopic)
-    val idempotency = DbIdempotencyChecker(db)
-    val deadLetters = DbDeadLetterSink(db)
+    val repo = DbWorkerRepository(db)
     val resultPublisher = KafkaResultPublisher(producer, appConfig.kafka)
-    val processor = IdempotentProcessor(analyzer, projections, idempotency, resultPublisher, deadLetters)
+    val processor = IdempotentProcessor(analyzer, repo, resultPublisher)
+    val rebuilds = RebuildService(eventStore, repo, analyzer)
 
     val writes = StoryboardWriteService(db, eventStore)
     val imports = StreamingImportService(db, eventStore, appConfig.import.chunkSize)
@@ -66,7 +64,7 @@ fun Application.module() {
     configureStatusPages()
 
     routing {
-        storyboardRoutes(writes, projections, imports, deadLetters, appScope)
+        storyboardRoutes(writes, repo, imports, processor, rebuilds, appScope)
     }
 
     monitor.subscribe(io.ktor.server.application.ApplicationStopped) {

@@ -89,6 +89,7 @@ object DeadLetter : LongIdTable("dead_letter") {
     val error = text("error")
     val attempts = integer("attempts")
     val replayed = bool("replayed").default(false)
+    val replayedAt = timestamp("replayed_at").nullable()
     val createdAt = timestamp("created_at")
 }
 
@@ -104,4 +105,34 @@ object ImportJobs : Table("import_job") {
     val createdAt = timestamp("created_at")
     val updatedAt = timestamp("updated_at")
     override val primaryKey = PrimaryKey(jobId)
+}
+
+/**
+ * Durable out-of-order buffer. Events ahead of the contiguous head are persisted
+ * here so a worker crash before the missing version arrives never loses them.
+ */
+object PendingEvents : Table("pending_event") {
+    val storyboardId = varchar("storyboard_id", 64)
+    val version = long("version")
+    val eventId = varchar("event_id", 64)
+    val payload = text("payload")
+    val receivedAt = timestamp("received_at")
+    override val primaryKey = PrimaryKey(storyboardId, version)
+}
+
+/** Persistent, backpressured staging source for streaming imports. */
+object ImportSegments : Table("import_segment") {
+    val jobId = varchar("job_id", 64)
+    val offsetIndex = long("offset_index")
+    val payload = text("payload")
+    override val primaryKey = PrimaryKey(jobId, offsetIndex)
+}
+
+/** Audit trail for DLQ replays and projection rebuilds. */
+object ReplayAudit : LongIdTable("replay_audit") {
+    val kind = varchar("kind", 32)
+    val target = varchar("target", 128)
+    val detail = text("detail")
+    val outcome = varchar("outcome", 16)
+    val createdAt = timestamp("created_at")
 }

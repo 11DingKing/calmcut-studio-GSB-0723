@@ -85,6 +85,7 @@ CREATE TABLE IF NOT EXISTS dead_letter (
     error           TEXT        NOT NULL,
     attempts        INT         NOT NULL,
     replayed        BOOLEAN     NOT NULL DEFAULT FALSE,
+    replayed_at     TIMESTAMP,
     created_at      TIMESTAMP   NOT NULL DEFAULT now()
 );
 
@@ -100,3 +101,39 @@ CREATE TABLE IF NOT EXISTS import_job (
     created_at      TIMESTAMP   NOT NULL DEFAULT now(),
     updated_at      TIMESTAMP   NOT NULL DEFAULT now()
 );
+
+-- Durable out-of-order buffer: events whose version is ahead of the contiguous
+-- head are persisted here (NOT kept only in JVM memory) so a worker crash before
+-- the missing version arrives cannot lose them. Drained in version order once
+-- the gap fills. This is what makes offset commits safe.
+CREATE TABLE IF NOT EXISTS pending_event (
+    storyboard_id   VARCHAR(64) NOT NULL,
+    version         BIGINT      NOT NULL,
+    event_id        UUID        NOT NULL,
+    payload         JSONB       NOT NULL,
+    received_at     TIMESTAMP   NOT NULL DEFAULT now(),
+    PRIMARY KEY (storyboard_id, version)
+);
+
+-- Streaming import staging: the persistent, backpressured data source for an
+-- import job. The HTTP ingest streams rows straight into this table (bounded
+-- memory), and the importer consumes them by offset so cancel/resume restarts
+-- from the DB checkpoint rather than any in-memory position.
+CREATE TABLE IF NOT EXISTS import_segment (
+    job_id          UUID        NOT NULL,
+    offset_index    BIGINT      NOT NULL,
+    payload         JSONB       NOT NULL,
+    PRIMARY KEY (job_id, offset_index)
+);
+
+-- Audit trail for dead-letter replays and projection rebuilds so replay state is
+-- fully auditable (who/what/when/outcome).
+CREATE TABLE IF NOT EXISTS replay_audit (
+    id              BIGSERIAL PRIMARY KEY,
+    kind            VARCHAR(32) NOT NULL,       -- DLQ_REPLAY | PROJECTION_REBUILD
+    target          VARCHAR(128) NOT NULL,      -- event_id or storyboard_id
+    detail          TEXT        NOT NULL,
+    outcome         VARCHAR(16) NOT NULL,       -- SUCCESS | FAILURE
+    created_at      TIMESTAMP   NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_replay_audit_target ON replay_audit (target, id);

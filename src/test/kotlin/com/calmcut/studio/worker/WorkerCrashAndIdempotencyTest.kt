@@ -5,9 +5,7 @@ import com.calmcut.studio.analysis.RiskAnalyzer
 import com.calmcut.studio.domain.EventType
 import com.calmcut.studio.domain.Segment
 import com.calmcut.studio.domain.StoryboardEvent
-import com.calmcut.studio.testutil.InMemoryDeadLetterSink
-import com.calmcut.studio.testutil.InMemoryIdempotencyChecker
-import com.calmcut.studio.testutil.InMemoryProjectionStore
+import com.calmcut.studio.testutil.InMemoryWorkerRepository
 import com.calmcut.studio.testutil.RecordingResultPublisher
 import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
@@ -18,16 +16,12 @@ class WorkerCrashAndIdempotencyTest {
 
     private fun newProcessor(
         publisher: RecordingResultPublisher = RecordingResultPublisher(),
-        dlq: InMemoryDeadLetterSink = InMemoryDeadLetterSink(),
-        idem: InMemoryIdempotencyChecker = InMemoryIdempotencyChecker(),
-        store: InMemoryProjectionStore = InMemoryProjectionStore(),
+        repo: InMemoryWorkerRepository = InMemoryWorkerRepository(),
         maxAttempts: Int = 3,
     ) = IdempotentProcessor(
         analyzer = RiskAnalyzer(AnalysisSettings()),
-        store = store,
-        idempotency = idem,
+        repo = repo,
         publisher = publisher,
-        deadLetters = dlq,
         maxAttempts = maxAttempts,
     )
 
@@ -61,25 +55,53 @@ class WorkerCrashAndIdempotencyTest {
     @Test
     fun `out of order events are buffered then applied in order`() = runTest {
         val publisher = RecordingResultPublisher()
-        val processor = newProcessor(publisher)
-        // Deliver v2 and v3 before v1.
+        val repo = InMemoryWorkerRepository()
+        val processor = newProcessor(publisher, repo)
+        // Deliver v2 and v3 before v1 — they must be durably buffered.
         processor.process(importEvent(2, listOf(seg("a", 0), seg("b", 1))))
         processor.process(importEvent(3, listOf(seg("a", 0))))
         assertTrue(publisher.published.isEmpty(), "nothing releases before v1")
+        assertTrue(repo.nextPending("sb", 2) != null, "v2 must be durably buffered")
+        assertTrue(repo.nextPending("sb", 3) != null, "v3 must be durably buffered")
+
         processor.process(importEvent(1, listOf(seg("a", 0))))
-        // v1 releases, then buffered v2 and v3 flush in order.
+        // v1 applies, then buffered v2 and v3 drain in order.
+        assertEquals(listOf(1L, 2L, 3L), publisher.published.map { it.version })
+        assertTrue(repo.nextPending("sb", 2) == null, "buffer drained")
+    }
+
+    @Test
+    fun `crash after buffering but before gap fill does not lose events`() = runTest {
+        // Simulate: worker durably buffers v2/v3, then "crashes" (new processor,
+        // same repo). The missing v1 arrives at the new worker; buffered events
+        // must still be applied — proving the buffer is durable, not in-memory.
+        val publisher = RecordingResultPublisher()
+        val repo = InMemoryWorkerRepository()
+        val worker1 = newProcessor(publisher, repo)
+        worker1.process(importEvent(3, listOf(seg("a", 0))))
+        worker1.process(importEvent(2, listOf(seg("a", 0), seg("b", 1))))
+
+        // Crash & restart: brand-new processor over the SAME durable repo.
+        val worker2 = newProcessor(publisher, repo)
+        worker2.process(importEvent(1, listOf(seg("a", 0))))
+
         assertEquals(listOf(1L, 2L, 3L), publisher.published.map { it.version })
     }
 
     @Test
     fun `stale events below processed version are ignored`() = runTest {
         val publisher = RecordingResultPublisher()
-        val idem = InMemoryIdempotencyChecker()
-        idem.recordVersion("sb", 5)
-        val processor = newProcessor(publisher, idem = idem)
+        val repo = InMemoryWorkerRepository()
+        // Bring the storyboard to v5 first.
+        val warm = newProcessor(publisher, repo)
+        warm.process(importEvent(1, listOf(seg("a", 0))))
+        for (v in 2..5L) warm.process(StoryboardEvent("u$v", "sb", v, EventType.SEGMENT_CREATED, segments = listOf(seg("s$v", v.toInt()))))
+        val before = publisher.published.size
+
+        val processor = newProcessor(publisher, repo)
         val results = processor.process(importEvent(3, listOf(seg("a", 0))))
         assertTrue(results.isEmpty())
-        assertTrue(publisher.published.isEmpty())
+        assertEquals(before, publisher.published.size, "stale event produces no new result")
     }
 
     @Test
@@ -92,36 +114,36 @@ class WorkerCrashAndIdempotencyTest {
     }
 
     @Test
-    fun `exhausted retries route event to DLQ and can be replayed`() = runTest {
+    fun `exhausted retries route event to DLQ and can be replayed with audit`() = runTest {
         val publisher = RecordingResultPublisher().apply { failNextCount = 100 }
-        val dlq = InMemoryDeadLetterSink()
-        val processor = newProcessor(publisher, dlq = dlq, maxAttempts = 2)
+        val repo = InMemoryWorkerRepository()
+        val processor = newProcessor(publisher, repo, maxAttempts = 2)
         processor.process(importEvent(1, listOf(seg("a", 0))))
-        assertEquals(1, dlq.list().size, "poisoned event must land in DLQ")
+        assertEquals(1, repo.listDeadLetters().size, "poisoned event must land in DLQ")
 
         // Fix the downstream and replay from the DLQ.
         publisher.failNextCount = 0
         val replayed = processor.replayDeadLetter("imp-1")
         assertEquals(1, replayed.size)
         assertEquals(1, publisher.published.size)
-        assertTrue(dlq.list().single().replayed)
+        assertTrue(repo.listDeadLetters().single().replayed)
+        // Replay must be auditable.
+        val audit = processor.auditTrail("imp-1")
+        assertTrue(audit.any { it.kind == WorkerRepository.AUDIT_DLQ_REPLAY && it.outcome == WorkerRepository.OUTCOME_SUCCESS })
     }
 
     @Test
-    fun `crash before idempotency commit reproduces identical projection on replay`() = runTest {
-        // Simulate a crash after publish by using a fresh processor sharing the
-        // same store/idempotency, re-delivering the same event.
-        val store = InMemoryProjectionStore()
-        val idem = InMemoryIdempotencyChecker()
+    fun `crash before commit reproduces identical projection on replay`() = runTest {
+        val repo = InMemoryWorkerRepository()
         val publisher = RecordingResultPublisher()
-        val processor1 = newProcessor(publisher, idem = idem, store = store)
+        val processor1 = newProcessor(publisher, repo)
         processor1.process(importEvent(1, listOf(seg("a", 0), seg("b", 1))))
-        val firstState = store.loadState("sb")!!
+        val firstState = repo.loadState("sb")
 
         // New worker instance (post-crash) re-consumes the same event id.
-        val processor2 = newProcessor(publisher, idem = idem, store = store)
+        val processor2 = newProcessor(publisher, repo)
         processor2.process(importEvent(1, listOf(seg("a", 0), seg("b", 1))))
-        val secondState = store.loadState("sb")!!
+        val secondState = repo.loadState("sb")
 
         assertEquals(firstState.segmentsById, secondState.segmentsById)
         assertEquals(1, publisher.published.size, "redelivery after commit is a no-op")
