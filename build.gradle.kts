@@ -64,4 +64,11 @@ kotlin {
 
 tasks.withType<Test> {
     useJUnitPlatform()
+    // Configure Docker socket for OrbStack/macOS environments
+    val socketPath = "/Users/huangding/.orbstack/run/docker.sock"
+    systemProperty("docker.host", "unix://$socketPath")
+    environment("DOCKER_HOST", "unix://$socketPath")
+    environment("TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE", socketPath)
+    environment("TESTCONTAINERS_CHECKS_DISABLE", "true")
+    jvmArgs("-Dtestcontainers.reuse.enable=true")
 }

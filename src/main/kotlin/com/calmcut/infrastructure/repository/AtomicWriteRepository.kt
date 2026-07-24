@@ -226,50 +226,153 @@ class AtomicWriteRepository {
                 .count() > 0
         }
 
-    suspend fun validateTimelineContinuous(
-        storyboardId: java.util.UUID,
-        newSegments: List<Pair<Long, Long>>? = null,
-        excludeSegmentId: UUID? = null
+    suspend fun validateTimelineForAdd(
+        storyboardId: UUID,
+        newStartMs: Long,
+        newEndMs: Long
     ): TimelineValidationDb {
-        return newSuspendedTransaction {
-            val existingSegments = StoryboardSegments.select(
-                StoryboardSegments.id, StoryboardSegments.startTimeMs, StoryboardSegments.endTimeMs
-            )
-                .where { StoryboardSegments.storyboardId eq storyboardId }
-                .orderBy(StoryboardSegments.startTimeMs, SortOrder.ASC)
-                .map {
-                    Triple(
-                        it[StoryboardSegments.id],
-                        it[StoryboardSegments.startTimeMs],
-                        it[StoryboardSegments.endTimeMs]
-                    )
-                }
-                .filter { excludeSegmentId == null || it.first != excludeSegmentId }
+        return validateTimelineInternal(
+            storyboardId = storyboardId,
+            virtualSegments = listOf(newStartMs to newEndMs),
+            excludeSegmentId = null,
+            replaceSegmentId = null,
+            replaceWith = null
+        )
+    }
 
-            val allTimeRanges = existingSegments.map { it.second to it.third } + (newSegments ?: emptyList())
-            val sorted = allTimeRanges.sortedBy { it.first }
+    suspend fun validateTimelineForUpdate(
+        storyboardId: UUID,
+        segmentId: UUID,
+        newStartMs: Long,
+        newEndMs: Long
+    ): TimelineValidationDb {
+        return validateTimelineInternal(
+            storyboardId = storyboardId,
+            virtualSegments = emptyList(),
+            excludeSegmentId = null,
+            replaceSegmentId = segmentId,
+            replaceWith = newStartMs to newEndMs
+        )
+    }
 
-            val overlaps = mutableListOf<Pair<LongRange, LongRange>>()
-            val gaps = mutableListOf<LongRange>()
-            val outOfOrder = mutableListOf<String>()
+    suspend fun validateTimelineForDelete(
+        storyboardId: UUID,
+        segmentId: UUID
+    ): TimelineValidationDb {
+        return validateTimelineInternal(
+            storyboardId = storyboardId,
+            virtualSegments = emptyList(),
+            excludeSegmentId = segmentId,
+            replaceSegmentId = null,
+            replaceWith = null
+        )
+    }
 
-            for (i in 0 until sorted.size - 1) {
-                val current = sorted[i]
-                val next = sorted[i + 1]
-                if (next.first < current.second) {
-                    overlaps.add((current.first..current.second) to (next.first..next.second))
-                } else if (next.first > current.second) {
-                    gaps.add(current.second..next.first)
-                }
+    suspend fun validateTimelineForBatchImport(
+        storyboardId: UUID,
+        newSegments: List<Pair<Long, Long>>
+    ): TimelineValidationDb {
+        return validateTimelineInternal(
+            storyboardId = storyboardId,
+            virtualSegments = newSegments,
+            excludeSegmentId = null,
+            replaceSegmentId = null,
+            replaceWith = null
+        )
+    }
+
+    private suspend fun validateTimelineInternal(
+        storyboardId: UUID,
+        virtualSegments: List<Pair<Long, Long>>,
+        excludeSegmentId: UUID?,
+        replaceSegmentId: UUID?,
+        replaceWith: Pair<Long, Long>?
+    ): TimelineValidationDb = newSuspendedTransaction {
+        val existingSegments = StoryboardSegments.select(
+            StoryboardSegments.id, StoryboardSegments.startTimeMs, StoryboardSegments.endTimeMs
+        )
+            .where { StoryboardSegments.storyboardId eq storyboardId }
+            .orderBy(StoryboardSegments.startTimeMs, SortOrder.ASC)
+            .map { row ->
+                Triple(
+                    row[StoryboardSegments.id],
+                    row[StoryboardSegments.startTimeMs],
+                    row[StoryboardSegments.endTimeMs]
+                )
             }
 
-            TimelineValidationDb(
-                hasOverlaps = overlaps.isNotEmpty(),
-                overlappingPairs = overlaps,
-                gaps = gaps,
-                isContinuous = overlaps.isEmpty() && gaps.isEmpty()
+        val effectiveRanges = existingSegments
+            .filter { seg ->
+                val id = seg.first
+                when {
+                    excludeSegmentId != null && id == excludeSegmentId -> false
+                    replaceSegmentId != null && id == replaceSegmentId -> false
+                    else -> true
+                }
+            }
+            .map { it.second to it.third }
+            .toMutableList()
+
+        if (replaceSegmentId != null && replaceWith != null) {
+            effectiveRanges.add(replaceWith)
+        }
+
+        effectiveRanges.addAll(virtualSegments)
+
+        if (effectiveRanges.size <= 1) {
+            return@newSuspendedTransaction TimelineValidationDb(
+                hasOverlaps = false,
+                overlappingPairs = emptyList(),
+                gaps = emptyList(),
+                isContinuous = true,
+                errors = emptyList()
             )
         }
+
+        val sorted = effectiveRanges.sortedBy { it.first }
+
+        val overlaps = mutableListOf<Pair<LongRange, LongRange>>()
+        val gaps = mutableListOf<LongRange>()
+        val errors = mutableListOf<String>()
+
+        for (i in 0 until sorted.size - 1) {
+            val current = sorted[i]
+            val next = sorted[i + 1]
+
+            if (current.first >= current.second) {
+                errors.add("Segment has invalid range: [${current.first}, ${current.second})")
+            }
+            if (next.first >= next.second) {
+                errors.add("Segment has invalid range: [${next.first}, ${next.second})")
+            }
+
+            if (next.first < current.second) {
+                overlaps.add((current.first..current.second) to (next.first..next.second))
+                errors.add("Overlap detected: [${current.first}, ${current.second}) overlaps with [${next.first}, ${next.second})")
+            } else if (next.first > current.second) {
+                gaps.add(current.second..next.first)
+                errors.add("Gap detected: ${current.second}ms to ${next.first}ms (${next.first - current.second}ms) between adjacent segments")
+            }
+        }
+
+        if (sorted.isNotEmpty()) {
+            val first = sorted.first()
+            val last = sorted.last()
+            if (first.first < 0) {
+                errors.add("Segment starts before time 0: ${first.first}ms")
+            }
+            if (last.second <= last.first) {
+                errors.add("Last segment has invalid range: [${last.first}, ${last.second})")
+            }
+        }
+
+        TimelineValidationDb(
+            hasOverlaps = overlaps.isNotEmpty(),
+            overlappingPairs = overlaps,
+            gaps = gaps,
+            isContinuous = overlaps.isEmpty() && gaps.isEmpty() && errors.isEmpty(),
+            errors = errors
+        )
     }
 
     private fun serializeEvent(event: DomainEvent): String = when (event) {
@@ -290,5 +393,6 @@ data class TimelineValidationDb(
     val hasOverlaps: Boolean,
     val overlappingPairs: List<Pair<LongRange, LongRange>>,
     val gaps: List<LongRange>,
-    val isContinuous: Boolean
+    val isContinuous: Boolean,
+    val errors: List<String> = emptyList()
 )

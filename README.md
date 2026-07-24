@@ -251,14 +251,22 @@ docker-compose logs -f app
 export JAVA_HOME=/path/to/jdk17
 gradle build -x test
 
-# 运行单元测试（无 Docker 依赖）
-gradle test --tests "com.calmcut.domain.rules.*" --tests "com.calmcut.service.*" -i
+# 运行单元测试（60 tests，无 Docker 依赖）
+gradle test --tests "com.calmcut.domain.*" --tests "com.calmcut.service.*"
 
-# 运行集成测试（需要 Docker）
-gradle test --tests "com.calmcut.integration.*" -i
+# 运行集成测试（需要 Docker 或外部 PostgreSQL+Redpanda）
+# 方式 1: Docker (Testcontainers) - macOS/OrbStack 用户需设置 socket 路径
+gradle test --tests "com.calmcut.integration.*"
 
-# 启动服务（需先启动 PostgreSQL 和 Redpanda）
-gradle run
+# 方式 2: 使用外部 PostgreSQL 和 Redpanda
+export TEST_DATABASE_URL="jdbc:postgresql://localhost:5432/storyboard_risk"
+export TEST_DATABASE_USER=storyboard
+export TEST_DATABASE_PASSWORD=storyboard
+export TEST_KAFKA_BOOTSTRAP_SERVERS=localhost:9092
+gradle test --tests "com.calmcut.integration.*"
+
+# 运行全部测试（80 tests）
+gradle test --rerun-tasks --no-daemon
 ```
 
 ### 数据库迁移

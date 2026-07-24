@@ -71,8 +71,12 @@ class StoryboardCommandService(
         val errors = validateSegmentData(segment)
         if (errors.isNotEmpty()) return CommandResult.ValidationError(errors)
 
-        val timelineErrors = validateTimeline(sid, listOf(segment.startTimeMs to segment.endTimeMs))
-        if (timelineErrors.isNotEmpty()) return CommandResult.ValidationError(timelineErrors)
+        val timeline = atomicWriteRepository.validateTimelineForAdd(
+            sid.toUUID(), segment.startTimeMs, segment.endTimeMs
+        )
+        if (!timeline.isContinuous) {
+            return CommandResult.ValidationError(timeline.errors)
+        }
 
         val newVersion = expectedVersion + 1
         val event = SegmentAdded(
@@ -96,6 +100,24 @@ class StoryboardCommandService(
         val errors = validateChangeSet(changes)
         if (errors.isNotEmpty()) return CommandResult.ValidationError(errors)
 
+        val existingSegments = storyboardRepository.getSegments(sid)
+        val targetSegment = existingSegments.find { it.id.value == segmentId }
+            ?: return CommandResult.NotFound("Segment $segmentId not found in storyboard $storyboardId")
+
+        val newStartMs = changes.startTimeMs ?: targetSegment.startTimeMs
+        val newEndMs = changes.endTimeMs ?: targetSegment.endTimeMs
+
+        if (newEndMs <= newStartMs) {
+            return CommandResult.ValidationError(listOf("endTimeMs must be greater than startTimeMs after update"))
+        }
+
+        val timeline = atomicWriteRepository.validateTimelineForUpdate(
+            sid.toUUID(), UUID.fromString(segmentId), newStartMs, newEndMs
+        )
+        if (!timeline.isContinuous) {
+            return CommandResult.ValidationError(timeline.errors)
+        }
+
         val newVersion = expectedVersion + 1
         val event = SegmentUpdated(
             storyboardId = storyboardId,
@@ -103,11 +125,6 @@ class StoryboardCommandService(
             segmentId = segmentId,
             changes = changes
         )
-
-        if (changes.startTimeMs != null || changes.endTimeMs != null) {
-            val timelineErrors = validateTimeline(sid, null, UUID.fromString(segmentId))
-            if (timelineErrors.isNotEmpty()) return CommandResult.ValidationError(timelineErrors)
-        }
 
         return executeAtomically(storyboardId, expectedVersion, newVersion, event)
     }
@@ -117,6 +134,15 @@ class StoryboardCommandService(
         expectedVersion: Long,
         segmentId: String
     ): CommandResult {
+        val sid = StoryboardId(storyboardId)
+
+        val timeline = atomicWriteRepository.validateTimelineForDelete(
+            sid.toUUID(), UUID.fromString(segmentId)
+        )
+        if (!timeline.isContinuous) {
+            return CommandResult.ValidationError(timeline.errors)
+        }
+
         val newVersion = expectedVersion + 1
         val event = SegmentDeleted(
             storyboardId = storyboardId,
@@ -156,6 +182,12 @@ class StoryboardCommandService(
             validateSegmentData(seg).map { "Segment $index: $it" }
         }
         if (allErrors.isNotEmpty()) return CommandResult.ValidationError(allErrors)
+
+        val newRanges = segments.map { it.startTimeMs to it.endTimeMs }
+        val timeline = atomicWriteRepository.validateTimelineForBatchImport(sid.toUUID(), newRanges)
+        if (!timeline.isContinuous) {
+            return CommandResult.ValidationError(timeline.errors)
+        }
 
         val newVersion = expectedVersion + 1
         val event = SegmentsBatchImported(
@@ -214,27 +246,13 @@ class StoryboardCommandService(
         }
     }
 
-    private suspend fun validateTimeline(
-        storyboardId: StoryboardId,
-        newSegments: List<Pair<Long, Long>>? = null,
-        excludeSegmentId: UUID? = null
-    ): List<String> {
-        val result = atomicWriteRepository.validateTimelineContinuous(
-            storyboardId.toUUID(),
-            newSegments,
-            excludeSegmentId
-        )
-        val errors = mutableListOf<String>()
-        if (result.hasOverlaps) {
-            errors.add("Timeline has overlapping segments: ${result.overlappingPairs.size} overlap(s) detected")
-        }
-        return errors
-    }
-
     private fun validateSegmentData(segment: SegmentData): List<String> {
         val errors = mutableListOf<String>()
         if (segment.endTimeMs <= segment.startTimeMs) {
             errors.add("endTimeMs must be greater than startTimeMs")
+        }
+        if (segment.startTimeMs < 0) {
+            errors.add("startTimeMs must be non-negative")
         }
         if (segment.stimulusIntensity !in 1..5) {
             errors.add("stimulusIntensity must be between 1 and 5")
