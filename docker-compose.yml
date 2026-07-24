@@ -1,0 +1,78 @@
+version: "3.8"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: storyboard-postgres
+    environment:
+      POSTGRES_DB: storyboard_risk
+      POSTGRES_USER: storyboard
+      POSTGRES_PASSWORD: storyboard
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U storyboard -d storyboard_risk"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redpanda:
+    image: docker.redpanda.com/vectorized/redpanda:v23.3.6
+    container_name: storyboard-redpanda
+    command:
+      - redpanda start
+      - --smp 1
+      - --overprovisioned
+      - --node-id 0
+      - --kafka-addr PLAINTEXT://0.0.0.0:9092,OUTSIDE://0.0.0.0:19092
+      - --advertise-kafka-addr PLAINTEXT://redpanda:9092,OUTSIDE://localhost:19092
+      - --rpc-addr 0.0.0.0:33145
+      - --advertise-rpc-addr redpanda:33145
+      - --set redpanda.enable_idempotence=true
+      - --set redpanda.enable_transactions=true
+    ports:
+      - "9092:9092"
+      - "19092:19092"
+      - "19644:9644"
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy'"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  redpanda-console:
+    image: docker.redpanda.com/vectorized/console:v2.3.8
+    container_name: storyboard-redpanda-console
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+    ports:
+      - "8081:8080"
+    depends_on:
+      redpanda:
+        condition: service_healthy
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: storyboard-risk-analyzer
+    environment:
+      DATABASE_URL: "jdbc:postgresql://postgres:5432/storyboard_risk"
+      DATABASE_USER: storyboard
+      DATABASE_PASSWORD: storyboard
+      REDPANDA_BOOTSTRAP_SERVERS: redpanda:9092
+      PORT: "8080"
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  pgdata:
