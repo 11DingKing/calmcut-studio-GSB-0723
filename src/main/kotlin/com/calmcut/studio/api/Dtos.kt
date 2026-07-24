@@ -95,6 +95,7 @@ data class ImportJobResponse(
     val status: String,
     val totalSegments: Long,
     val processedSegments: Long,
+    val stagedSegments: Long = 0,
 )
 
 @Serializable

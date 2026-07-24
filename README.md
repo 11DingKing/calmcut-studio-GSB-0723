@@ -75,8 +75,8 @@ docker compose up -d           # 启动 PostgreSQL + Redpanda
 | POST | `/storyboards/segments/update` | 修改单段 |
 | POST | `/storyboards/segments/delete` | 删除单段 |
 | GET  | `/storyboards/{id}/analysis` | 查询最新分析结果 |
-| POST | `/imports` | 启动流式导入（先落 `import_segment` 暂存表，再应用；百万分镜、分块、检查点）|
-| GET  | `/imports/{jobId}` | 查询导入进度 |
+| POST | `/imports/{storyboardId}/stream` | **流式 NDJSON 导入**：请求体每行一个 JSON `Segment`，边收边分块落 `import_segment` 暂存表（内存 O(chunk)，非 O(total)）|
+| GET  | `/imports/{jobId}` | 查询导入进度（含已暂存 `stagedSegments`）|
 | POST | `/imports/{jobId}/cancel` | 取消导入（持久化取消标志）|
 | POST | `/imports/{jobId}/resume` | **真正**从数据库检查点重启应用阶段 |
 | POST | `/storyboards/{id}/rebuild` | 从事件日志从零重建投影（可审计）|
@@ -87,10 +87,12 @@ docker compose up -d           # 启动 PostgreSQL + Redpanda
 
 乐观锁冲突返回 `409`，知识点完整性校验失败返回 `422`。
 
-### 流式导入两阶段（真背压）
+### 流式导入两阶段（真背压、内存有界）
 
-1. **Ingest**：请求体的分镜流被惰性消费、按块写入持久化暂存表 `import_segment`（不把全部 segment 反序列化进内存），只有上一块提交后才拉取下一块——保留背压。
-2. **Apply**：按 offset 从暂存表分页读回、逐块追加为事件并在每块后写检查点。取消/恢复都基于数据库检查点，`resume` 会真正继续跑而非仅返回占位状态。
+1. **Ingest（`POST /imports/{storyboardId}/stream`）**：直接 `call.receiveChannel()` 拿到请求体的 `ByteReadChannel`，用挂起式 `readUTF8Line` **逐行增量解析** NDJSON（读下一批字节前先提交上一块，天然背压）。解析出的 segment 累积到 `chunkSize` 就批量 `INSERT ... ON CONFLICT DO NOTHING` 落 `import_segment`，随即清空缓冲——常驻内存 O(chunkSize)，不随分镜总数增长。
+   - `?jobId=<id>`：复用同一任务实现**恢复/幂等**；已暂存前缀按行号跳过，重复请求/恢复不重复写入。
+   - `X-Total-Segments` 头：声明总数用于**断流检测**；不足则保留已暂存行并返回 `422`，供后续 resume 补齐。
+2. **Apply**：按 offset 从暂存表分页读回、逐块追加为事件；每块在**锁定 `import_job` 行（SELECT … FOR UPDATE）**的同一事务内追加事件并推进检查点，因此并发/重复 resume 也**恰好一次**、不双写。取消/恢复均基于数据库检查点，`resume` 真正续跑。
 
 ## 测试覆盖
 
@@ -103,8 +105,9 @@ docker compose up -d           # 启动 PostgreSQL + Redpanda
 - `TimelineValidationTest` — 连续无重叠时间轴 + 原版/修订版知识点完整性
 - `StreamingImportTest` — 分块/跳过/取消的纯逻辑
 
-端到端测试 `RealInfraE2ETest`（Testcontainers 拉起**真实** PostgreSQL 16 + Redpanda；无 Docker 时自动跳过）：
+端到端测试（Testcontainers 拉起**真实** PostgreSQL 16 + Redpanda；无 Docker 时自动跳过）：
 
+`RealInfraE2ETest`
 - outbox → 真实 Redpanda 投递并被消费者读到
 - 乱序事件持久化后 worker 崩溃重启不丢事件
 - 重复消息对真实 DB 幂等
@@ -114,8 +117,14 @@ docker compose up -d           # 启动 PostgreSQL + Redpanda
 - 事件日志重建投影修复漂移（含审计）
 - 增量分析（worker 真实链路）与全量重算逐项一致
 
+`StreamingImportHttpE2ETest`（**真实 Ktor HTTP 客户端**经 TCP 流式发送 NDJSON 到内嵌 Netty + 真实 PostgreSQL）
+- 百万条经 HTTP 流式导入：服务端峰值缓冲 ≤ chunkSize（内存有界）且数据完整无缺失/重复
+- 客户端中途断流：已暂存前缀保留、任务可恢复，重发整流后补齐且不重复
+- 取消后 resume 恰好一次完成
+- 多个并发 resume 不双写
+
 ```bash
-./gradlew test          # 45 个测试；E2E 在有 Docker 时自动运行
+./gradlew test          # 50 个测试；E2E 在有 Docker 时自动运行
 ```
 
 ## 技术栈

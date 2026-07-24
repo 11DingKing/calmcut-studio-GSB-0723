@@ -50,6 +50,10 @@ dependencies {
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.9.0")
     testImplementation("io.ktor:ktor-server-test-host:$ktorVersion")
 
+    // Real HTTP client for streaming integration tests (CIO engine supports
+    // streaming request bodies via a WriteChannel).
+    testImplementation("io.ktor:ktor-client-cio:$ktorVersion")
+
     // End-to-end tests against real PostgreSQL + Redpanda (Kafka API) via Testcontainers.
     testImplementation("org.testcontainers:testcontainers:1.20.4")
     testImplementation("org.testcontainers:junit-jupiter:1.20.4")
