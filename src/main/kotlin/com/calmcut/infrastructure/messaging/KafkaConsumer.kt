@@ -1,7 +1,7 @@
 package com.calmcut.infrastructure.messaging
 
 import com.calmcut.domain.events.*
-import com.calmcut.infrastructure.repository.ConsumerOffsetRepository
+import com.calmcut.infrastructure.repository.AtomicWriteRepository
 import com.calmcut.infrastructure.repository.DeadLetterRepository
 import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.Mutex
@@ -62,7 +62,6 @@ class OutOfOrderEventBuffer {
             val processed = processedVersions.computeIfAbsent(storyboardId) { ConcurrentHashMap.newKeySet() }
 
             if (processed.contains(version)) {
-                logger.debug { "Duplicate event version $version for storyboard $storyboardId, skipping" }
                 return emptyList()
             }
 
@@ -92,12 +91,6 @@ class OutOfOrderEventBuffer {
         }
     }
 
-    suspend fun getBufferedCount(storyboardId: String): Int {
-        mutex.withLock {
-            return buffers[storyboardId]?.size ?: 0
-        }
-    }
-
     suspend fun clear(storyboardId: String) {
         mutex.withLock {
             buffers.remove(storyboardId)
@@ -118,9 +111,10 @@ fun interface DomainEventHandler {
 
 class EventConsumer(
     private val consumerFactory: KafkaConsumerFactory,
-    private val offsetRepository: ConsumerOffsetRepository,
+    private val atomicWriteRepository: AtomicWriteRepository,
     private val deadLetterRepository: DeadLetterRepository,
     private val topics: List<String>,
+    private val consumerGroupId: String,
     private val handler: DomainEventHandler
 ) {
     private val running = AtomicBoolean(false)
@@ -135,7 +129,7 @@ class EventConsumer(
         job = scope.launch {
             consumerFactory.create().use { consumer ->
                 consumer.subscribe(topics)
-                logger.info { "Event consumer started for topics: $topics" }
+                logger.info { "Event consumer started for topics: $topics (group=$consumerGroupId)" }
 
                 while (running.get() && isActive) {
                     try {
@@ -164,15 +158,26 @@ class EventConsumer(
     private suspend fun processRecord(record: ConsumerRecord<String, String>) {
         val tp = TopicPartition(record.topic(), record.partition())
         val storyboardId = record.key()
+        val offset = record.offset()
+
+        if (atomicWriteRepository.isOffsetProcessed(consumerGroupId, record.topic(), record.partition(), offset)) {
+            logger.debug { "Skipping already-processed offset $offset at ${record.topic()}-${record.partition()}" }
+            pendingCommits[tp] = OffsetAndMetadata(offset + 1)
+            return
+        }
 
         try {
             val event = decodeEvent(record.value())
-            val currentVersion = storyboardVersions.getOrDefault(storyboardId, 0L)
+            val persistedVersion = atomicWriteRepository.getProcessedVersion(consumerGroupId, storyboardId)
+            val inMemoryVersion = storyboardVersions.getOrDefault(storyboardId, persistedVersion)
+            val currentVersion = maxOf(inMemoryVersion, persistedVersion)
+            storyboardVersions[storyboardId] = currentVersion
             val expectedNext = currentVersion + 1
 
             if (event.aggregateVersion <= currentVersion) {
-                logger.debug { "Event ${event.eventType} version ${event.aggregateVersion} already processed for $storyboardId (current=$currentVersion)" }
-                pendingCommits[tp] = OffsetAndMetadata(record.offset() + 1)
+                logger.debug { "Event ${event.eventType} v${event.aggregateVersion} already processed for $storyboardId (current=$currentVersion)" }
+                atomicWriteRepository.saveProcessedOffset(consumerGroupId, record.topic(), record.partition(), offset, event.eventId, event.eventType, storyboardId)
+                pendingCommits[tp] = OffsetAndMetadata(offset + 1)
                 return
             }
 
@@ -183,47 +188,49 @@ class EventConsumer(
                     val result = handler.handle(buffered.event)
                     if (result.success && result.processedVersion != null) {
                         storyboardVersions[storyboardId] = result.processedVersion
-                        buffer.markProcessed(storyboardId, result.processedVersion)
+                        atomicWriteRepository.saveProcessedVersion(consumerGroupId, storyboardId, result.processedVersion)
                     }
                 }
-                pendingCommits[tp] = OffsetAndMetadata(record.offset() + 1)
+                atomicWriteRepository.saveProcessedOffset(consumerGroupId, record.topic(), record.partition(), offset, event.eventId, event.eventType, storyboardId)
+                pendingCommits[tp] = OffsetAndMetadata(offset + 1)
                 return
             }
 
             val result = handler.handle(event)
             if (result.success && result.processedVersion != null) {
                 storyboardVersions[storyboardId] = result.processedVersion
-                buffer.markProcessed(storyboardId, result.processedVersion)
+                atomicWriteRepository.saveProcessedVersion(consumerGroupId, storyboardId, result.processedVersion)
 
                 val extraReady = buffer.addAndGetReady(storyboardId, result.processedVersion + 1, event, record)
                 for (buffered in extraReady) {
                     val extraResult = handler.handle(buffered.event)
                     if (extraResult.success && extraResult.processedVersion != null) {
                         storyboardVersions[storyboardId] = extraResult.processedVersion
-                        buffer.markProcessed(storyboardId, extraResult.processedVersion)
+                        atomicWriteRepository.saveProcessedVersion(consumerGroupId, storyboardId, extraResult.processedVersion)
                     }
                 }
             } else {
                 deadLetterRepository.save(
                     originalTopic = record.topic(),
                     originalPartition = record.partition(),
-                    originalOffset = record.offset(),
+                    originalOffset = offset,
                     eventType = event.eventType,
                     storyboardId = storyboardId,
                     payload = record.value(),
-                    errorMessage = result.error ?: "Unknown handling error",
+                    errorMessage = result.error ?: "Processing failed",
                     errorStackTrace = null
                 )
             }
 
-            pendingCommits[tp] = OffsetAndMetadata(record.offset() + 1)
+            atomicWriteRepository.saveProcessedOffset(consumerGroupId, record.topic(), record.partition(), offset, event.eventId, event.eventType, storyboardId)
+            pendingCommits[tp] = OffsetAndMetadata(offset + 1)
         } catch (e: Exception) {
-            logger.error(e) { "Failed to process record at ${record.topic()}-${record.partition()}:${record.offset()}" }
+            logger.error(e) { "Failed to process record at ${record.topic()}-${record.partition()}:${offset}" }
             try {
                 deadLetterRepository.save(
                     originalTopic = record.topic(),
                     originalPartition = record.partition(),
-                    originalOffset = record.offset(),
+                    originalOffset = offset,
                     eventType = "UNKNOWN",
                     storyboardId = storyboardId,
                     payload = record.value(),
@@ -233,7 +240,7 @@ class EventConsumer(
             } catch (dlqError: Exception) {
                 logger.error(dlqError) { "Failed to write to dead letter queue" }
             }
-            pendingCommits[tp] = OffsetAndMetadata(record.offset() + 1)
+            pendingCommits[tp] = OffsetAndMetadata(offset + 1)
         }
     }
 
@@ -260,8 +267,8 @@ class EventConsumer(
     }
 
     private fun decodeEvent(payload: String): DomainEvent {
-        val node = json.parseToJsonElement(payload)
-        val eventType = node.jsonObject["eventType"]?.jsonPrimitive?.content
+        val node = json.parseToJsonElement(payload).jsonObject
+        val eventType = node["eventType"]?.jsonPrimitive?.content
             ?: throw IllegalArgumentException("Missing eventType in payload")
         return when (eventType) {
             "STORYBOARD_CREATED" -> json.decodeFromString<StoryboardCreated>(payload)

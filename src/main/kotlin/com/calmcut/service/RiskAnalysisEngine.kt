@@ -6,7 +6,6 @@ import com.calmcut.domain.rules.*
 import com.calmcut.infrastructure.repository.RiskProjectionRepository
 import com.calmcut.infrastructure.repository.StoryboardRepository
 import mu.KotlinLogging
-import java.util.concurrent.ConcurrentHashMap
 
 private val logger = KotlinLogging.logger {}
 
@@ -23,16 +22,15 @@ class RiskAnalysisEngine(
         val segments = storyboardRepository.getSegments(storyboardId)
         val sortedSegments = segments.sortedBy { it.startTimeMs }
 
-        val findings = rules.flatMap { rule ->
-            rule.evaluate(sortedSegments)
-        }
+        val findings = rules.flatMap { rule -> rule.evaluate(sortedSegments) }
+            .sortedWith(compareBy({ it.windowStartMs ?: 0 }, { it.ruleId.name }))
 
         val result = RiskAnalysisResult(
             storyboardId = storyboardId,
             ruleVersion = config.ruleVersion,
             projectionVersion = version,
             computedAt = System.currentTimeMillis(),
-            findings = findings.sortedWith(compareBy({ it.windowStartMs ?: 0 }, { it.ruleId.name })),
+            findings = findings,
             totalRiskScore = calculateRiskScore(findings)
         )
 
@@ -47,48 +45,30 @@ class RiskAnalysisEngine(
     ): RiskAnalysisResult {
         logger.debug { "Performing incremental analysis for storyboard ${storyboardId.value} at version $version (event=${event.eventType})" }
 
-        val affectedRange = determineAffectedRange(event)
-        val segments = if (affectedRange != null) {
-            val extendedStart = maxOf(0, affectedRange.start - config.windowSizeMs * 2)
-            val extendedEnd = affectedRange.endInclusive + config.windowSizeMs * 2
-            storyboardRepository.getSegmentsInRange(storyboardId, extendedStart, extendedEnd)
-        } else {
-            storyboardRepository.getSegments(storyboardId)
+        val dirtyRange = determineDirtyRange(event)
+
+        if (dirtyRange == null) {
+            return analyzeFull(storyboardId, version)
         }
 
-        val allSegments = if (affectedRange != null && segments.isNotEmpty()) {
-            storyboardRepository.getSegments(storyboardId).sortedBy { it.startTimeMs }
-        } else {
-            segments.sortedBy { it.startTimeMs }
-        }
-
-        val sortedSegments = allSegments.sortedBy { it.startTimeMs }
-
-        val findings = mutableListOf<RiskFinding>()
-        for (rule in rules) {
-            val ruleFindings = if (affectedRange != null) {
-                rule.evaluate(sortedSegments, affectedRange)
-            } else {
-                rule.evaluate(sortedSegments)
-            }
-            findings.addAll(ruleFindings)
-        }
-
+        val allSegments = storyboardRepository.getSegments(storyboardId).sortedBy { it.startTimeMs }
         val currentProjection = projectionRepository.getProjection(storyboardId)
-        val mergedFindings = if (currentProjection != null && affectedRange != null) {
-            val unaffected = currentProjection.findings.filter { finding ->
-                val findingStart = finding.windowStartMs
-                val findingEnd = finding.windowEndMs
-                findingStart == null || findingEnd == null ||
-                    findingEnd < affectedRange.start - config.windowSizeMs ||
-                    findingStart > affectedRange.endInclusive + config.windowSizeMs
-            }
-            (unaffected + findings)
-                .distinctBy { Triple(it.ruleId, it.windowStartMs, it.affectedSegmentIds.map { id -> id.value }) }
-                .sortedWith(compareBy({ it.windowStartMs ?: 0 }, { it.ruleId.name }))
-        } else {
-            findings.sortedWith(compareBy({ it.windowStartMs ?: 0 }, { it.ruleId.name }))
+
+        val newFindingsInDirtyRange = rules.flatMap { rule ->
+            rule.evaluate(allSegments, dirtyRange)
         }
+
+        val oldFindingsOutsideDirtyRange = if (currentProjection != null) {
+            currentProjection.findings.filter { finding ->
+                !findingOverlapsRange(finding, dirtyRange)
+            }
+        } else {
+            emptyList()
+        }
+
+        val mergedFindings = (oldFindingsOutsideDirtyRange + newFindingsInDirtyRange)
+            .distinctBy { findingKey(it) }
+            .sortedWith(compareBy({ it.windowStartMs ?: 0 }, { it.ruleId.name }))
 
         val result = RiskAnalysisResult(
             storyboardId = storyboardId,
@@ -97,8 +77,8 @@ class RiskAnalysisEngine(
             computedAt = System.currentTimeMillis(),
             findings = mergedFindings,
             totalRiskScore = calculateRiskScore(mergedFindings),
-            affectedWindowStartMs = affectedRange?.start,
-            affectedWindowEndMs = affectedRange?.endInclusive
+            affectedWindowStartMs = dirtyRange.start,
+            affectedWindowEndMs = dirtyRange.endInclusive
         )
 
         projectionRepository.saveProjection(result)
@@ -106,16 +86,17 @@ class RiskAnalysisEngine(
     }
 
     suspend fun verifyEquivalence(storyboardId: StoryboardId, version: Long): DriftCheckResult {
-        val segments = storyboardRepository.getSegments(storyboardId)
-        val sortedSegments = segments.sortedBy { it.startTimeMs }
+        val segments = storyboardRepository.getSegments(storyboardId).sortedBy { it.startTimeMs }
 
-        val fullFindings = rules.flatMap { it.evaluate(sortedSegments) }
+        val fullFindings = rules.flatMap { it.evaluate(segments) }
+            .sortedWith(compareBy({ it.windowStartMs ?: 0 }, { it.ruleId.name }))
+
         val fullResult = RiskAnalysisResult(
             storyboardId = storyboardId,
             ruleVersion = config.ruleVersion,
             projectionVersion = version,
             computedAt = System.currentTimeMillis(),
-            findings = fullFindings.sortedWith(compareBy({ it.windowStartMs ?: 0 }, { it.ruleId.name })),
+            findings = fullFindings,
             totalRiskScore = calculateRiskScore(fullFindings)
         )
 
@@ -129,13 +110,8 @@ class RiskAnalysisEngine(
             )
         }
 
-        val incrementalKeySet = currentProjection.findings.map {
-            "${it.ruleId}:${it.windowStartMs}:${it.windowEndMs}:${it.evidence.description.hashCode()}"
-        }.toSet()
-
-        val fullKeySet = fullResult.findings.map {
-            "${it.ruleId}:${it.windowStartMs}:${it.windowEndMs}:${it.evidence.description.hashCode()}"
-        }.toSet()
+        val fullKeySet = fullResult.findings.map { findingKey(it) }.toSet()
+        val incrementalKeySet = currentProjection.findings.map { findingKey(it) }.toSet()
 
         val missingFromIncremental = fullKeySet - incrementalKeySet
         val extraInIncremental = incrementalKeySet - fullKeySet
@@ -143,19 +119,19 @@ class RiskAnalysisEngine(
         val hasDrift = missingFromIncremental.isNotEmpty() || extraInIncremental.isNotEmpty()
         val driftDetails = buildString {
             if (missingFromIncremental.isNotEmpty()) {
-                appendLine("Missing from incremental projection:")
-                missingFromIncremental.take(10).forEach { appendLine("  - $it") }
-                if (missingFromIncremental.size > 10) appendLine("  ... and ${missingFromIncremental.size - 10} more")
+                appendLine("Missing from incremental projection (${missingFromIncremental.size} findings):")
+                missingFromIncremental.take(20).forEach { appendLine("  - $it") }
+                if (missingFromIncremental.size > 20) appendLine("  ... and ${missingFromIncremental.size - 20} more")
             }
             if (extraInIncremental.isNotEmpty()) {
-                appendLine("Extra in incremental projection:")
-                extraInIncremental.take(10).forEach { appendLine("  - $it") }
-                if (extraInIncremental.size > 10) appendLine("  ... and ${extraInIncremental.size - 10} more")
+                appendLine("Extra in incremental projection (${extraInIncremental.size} findings):")
+                extraInIncremental.take(20).forEach { appendLine("  - $it") }
+                if (extraInIncremental.size > 20) appendLine("  ... and ${extraInIncremental.size - 20} more")
             }
         }
 
         if (hasDrift) {
-            logger.warn { "Drift detected for storyboard ${storyboardId.value}: $driftDetails" }
+            logger.warn { "Drift detected for storyboard ${storyboardId.value}: ${missingFromIncremental.size} missing, ${extraInIncremental.size} extra" }
             projectionRepository.saveProjection(fullResult)
         }
 
@@ -170,32 +146,49 @@ class RiskAnalysisEngine(
 
         return DriftCheckResult(
             hasDrift = hasDrift,
-            message = if (hasDrift) driftDetails else "Incremental and full analysis match",
+            message = if (hasDrift) driftDetails else "Incremental and full analysis match exactly (${fullFindings.size} findings)",
             fullResult = fullResult,
             incrementalResult = currentProjection
         )
     }
 
-    private fun determineAffectedRange(event: DomainEvent): LongRange? {
+    private fun findingOverlapsRange(finding: RiskFinding, range: LongRange): Boolean {
+        val fStart = finding.windowStartMs ?: return true
+        val fEnd = finding.windowEndMs ?: return true
+        val extendedRange = (range.start - config.windowSizeMs)..(range.endInclusive + config.windowSizeMs)
+        return fEnd >= extendedRange.start && fStart <= extendedRange.endInclusive
+    }
+
+    private fun findingKey(f: RiskFinding): String =
+        "${f.ruleId}:${f.windowStartMs}:${f.windowEndMs}:${f.evidence.description.hashCode()}:${f.affectedSegmentIds.map { it.value }.sorted().joinToString(",")}"
+
+    private fun determineDirtyRange(event: DomainEvent): LongRange? {
+        val w = config.windowSizeMs
         return when (event) {
             is StoryboardCreated -> null
             is ProjectionRebuildRequested -> null
             is ImportJobCreated -> null
-            is ImportJobCompleted -> null
             is ImportJobCancelled -> null
+            is ImportJobCompleted -> null
             is SegmentsBatchImported -> 0L..Long.MAX_VALUE
             is SegmentAdded -> {
-                val seg = event.segment
-                (seg.startTimeMs - config.windowSizeMs)..(seg.endTimeMs + config.windowSizeMs)
+                val s = event.segment
+                (s.startTimeMs - w)..(s.endTimeMs + w)
             }
             is SegmentUpdated -> {
-                val changes = event.changes
-                val start = changes.startTimeMs ?: 0
-                val end = changes.endTimeMs ?: (start + 10000)
-                (start - config.windowSizeMs)..(end + config.windowSizeMs)
+                val c = event.changes
+                val start = c.startTimeMs
+                val end = c.endTimeMs
+                if (start != null && end != null) {
+                    (start - w)..(end + w)
+                } else if (start != null) {
+                    (start - w)..(start + w)
+                } else {
+                    null
+                }
             }
-            is SegmentDeleted -> 0L..Long.MAX_VALUE
-            is SegmentsReordered -> 0L..Long.MAX_VALUE
+            is SegmentDeleted -> null
+            is SegmentsReordered -> null
         }
     }
 

@@ -1,6 +1,8 @@
 package com.calmcut.infrastructure.messaging
 
+import com.calmcut.domain.StoryboardId
 import com.calmcut.infrastructure.db.Storyboards
+import com.calmcut.infrastructure.repository.AtomicWriteRepository
 import com.calmcut.infrastructure.repository.RiskProjectionRepository
 import com.calmcut.infrastructure.repository.StoryboardRepository
 import com.calmcut.service.EventProcessor
@@ -16,7 +18,8 @@ class ProjectionDriftChecker(
     private val projectionRepository: RiskProjectionRepository,
     private val storyboardRepository: StoryboardRepository,
     private val analysisEngine: RiskAnalysisEngine,
-    private val eventProcessor: EventProcessor
+    private val eventProcessor: EventProcessor,
+    private val atomicWriteRepository: AtomicWriteRepository
 ) {
     fun start(scope: CoroutineScope, intervalSeconds: Long = 3600) {
         scope.launch {
@@ -46,8 +49,8 @@ class ProjectionDriftChecker(
         var drifted = 0
         for (idStr in storyboardIds) {
             try {
-                val id = com.calmcut.domain.StoryboardId(idStr)
-                val version = storyboardRepository.getCurrentVersion(id) ?: continue
+                val id = StoryboardId(idStr)
+                val version = atomicWriteRepository.getProcessedVersion("storyboard-risk-worker", idStr)
                 val result = analysisEngine.verifyEquivalence(id, version)
                 if (result.hasDrift) {
                     drifted++
@@ -71,7 +74,7 @@ class ProjectionDriftChecker(
         var rebuilt = 0
         for (idStr in storyboardIds) {
             try {
-                val id = com.calmcut.domain.StoryboardId(idStr)
+                val id = StoryboardId(idStr)
                 eventProcessor.rebuildProjectionFromScratch(id)
                 rebuilt++
             } catch (e: Exception) {

@@ -1,8 +1,6 @@
 package com.calmcut.infrastructure.messaging
 
-import com.calmcut.domain.StoryboardId
 import com.calmcut.domain.events.*
-import com.calmcut.infrastructure.messaging.KafkaProducerFactory
 import com.calmcut.infrastructure.repository.DeadLetterRecord
 import com.calmcut.infrastructure.repository.DeadLetterRepository
 import com.calmcut.service.EventProcessor
@@ -20,7 +18,8 @@ class DeadLetterReplayer(
     private val deadLetterRepository: DeadLetterRepository,
     private val eventProcessor: EventProcessor,
     private val producerFactory: KafkaProducerFactory,
-    private val topic: String
+    private val topic: String,
+    private val consumerGroupId: String
 ) {
     private val running = AtomicBoolean(false)
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -50,7 +49,7 @@ class DeadLetterReplayer(
     private suspend fun retryDeadLetter(record: DeadLetterRecord) {
         try {
             val event = decodeEvent(record.eventType, record.payload)
-            val result = eventProcessor.processEvent(event)
+            val result = eventProcessor.processEvent(event, consumerGroupId)
 
             if (result.success) {
                 deadLetterRepository.markRetried(record.id, success = true)

@@ -1,32 +1,24 @@
 package com.calmcut.service
 
 import com.calmcut.domain.StoryboardId
-import com.calmcut.domain.events.ImportJobCancelled
-import com.calmcut.domain.events.ImportJobCompleted
-import com.calmcut.domain.events.ImportJobCreated
-import com.calmcut.domain.events.SegmentData
-import com.calmcut.domain.events.SegmentsBatchImported
-import com.calmcut.infrastructure.repository.EventLogRepository
-import com.calmcut.infrastructure.repository.ImportJobStatus
-import com.calmcut.infrastructure.repository.ImportRepository
-import com.calmcut.infrastructure.repository.OptimisticLockException
-import com.calmcut.infrastructure.repository.StoryboardRepository
+import com.calmcut.domain.events.*
+import com.calmcut.infrastructure.repository.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.flow
 import mu.KotlinLogging
-import java.util.UUID
+import java.util.*
 import java.util.concurrent.atomic.AtomicBoolean
 
 private val logger = KotlinLogging.logger {}
 
 class StreamingImportService(
     private val storyboardRepository: StoryboardRepository,
-    private val eventLogRepository: EventLogRepository,
+    private val atomicWriteRepository: AtomicWriteRepository,
     private val importRepository: ImportRepository,
     private val eventProcessor: EventProcessor,
     private val batchSize: Int = 1000,
-    private val maxConcurrentJobs: Int = 2
+    private val maxConcurrentJobs: Int = 2,
+    private val eventTopic: String = "storyboard-events"
 ) {
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val activeJobs = mutableMapOf<String, Job>()
@@ -53,7 +45,7 @@ class StreamingImportService(
             importJobId = jobId,
             totalSegments = totalSegments
         )
-        eventLogRepository.append(event)
+        atomicWriteRepository.appendEventAndOutboxAtomically(event, eventTopic, currentVersion, storyboardId.value)
 
         val job = scope.launch {
             try {
@@ -114,8 +106,7 @@ class StreamingImportService(
                 totalProcessed = processedCount,
                 totalFailed = 0
             )
-            eventLogRepository.append(completeEvent)
-            eventLogRepository.appendOutbox(completeEvent, "storyboard-events")
+            atomicWriteRepository.appendEventAndOutboxAtomically(completeEvent, eventTopic, currentVersion, storyboardId.value)
 
             importRepository.updateJobStatus(jobId, ImportJobStatus.COMPLETED)
             logger.info { "Import job $jobId completed: $processedCount segments processed" }
@@ -140,21 +131,18 @@ class StreamingImportService(
         importRepository.insertBatches(jobId, listOf(batch))
 
         try {
-            version = storyboardRepository.incrementVersion(storyboardId, version)
-
+            val newVersion = version + 1
             val event = SegmentsBatchImported(
                 storyboardId = storyboardId.value,
-                aggregateVersion = version,
+                aggregateVersion = newVersion,
                 importJobId = jobId,
                 segments = batch,
                 batchStartVersion = processedSoFar.toLong()
             )
 
-            eventLogRepository.append(event)
-            eventLogRepository.appendOutbox(event, "storyboard-events")
+            atomicWriteRepository.appendEventAndOutboxAtomically(event, eventTopic, version, storyboardId.value)
 
             importRepository.markBatchProcessed(jobId, batchNumber, success = true)
-
             eventProcessor.processEvent(event)
         } catch (e: OptimisticLockException) {
             logger.warn { "Optimistic lock conflict for batch $batchNumber, retrying..." }
@@ -175,7 +163,7 @@ class StreamingImportService(
             importJobId = jobId,
             checkpoint = checkpoint
         )
-        eventLogRepository.append(cancelEvent)
+        atomicWriteRepository.appendEventAndOutboxAtomically(cancelEvent, eventTopic, currentVersion, storyboardId.value)
         importRepository.updateJobStatus(jobId, ImportJobStatus.CANCELLED)
         logger.info { "Import job $jobId cancelled at checkpoint $checkpoint" }
     }
@@ -220,7 +208,7 @@ class StreamingImportService(
 
     suspend fun getJobStatus(jobId: String) = importRepository.getJob(jobId)
 
-    fun createSegmentFlowFromList(segments: List<SegmentData>): Flow<SegmentData> = flow {
+    fun createSegmentFlowFromList(segments: List<SegmentData>): Flow<SegmentData> = kotlinx.coroutines.flow.flow {
         segments.forEach { emit(it) }
     }
 }

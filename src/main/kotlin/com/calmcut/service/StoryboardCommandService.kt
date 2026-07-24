@@ -2,16 +2,14 @@ package com.calmcut.service
 
 import com.calmcut.domain.*
 import com.calmcut.domain.events.*
-import com.calmcut.infrastructure.repository.EventLogRepository
-import com.calmcut.infrastructure.repository.OptimisticLockException
-import com.calmcut.infrastructure.repository.StoryboardRepository
+import com.calmcut.infrastructure.repository.*
 import mu.KotlinLogging
 import java.util.UUID
 
 private val logger = KotlinLogging.logger {}
 
 sealed class CommandResult {
-    data class Success(val storyboardId: String, val version: Long, val eventId: String) : CommandResult()
+    data class Success(val storyboardId: String, val version: Long, val eventId: String, val eventLogId: Long = 0) : CommandResult()
     data class VersionConflict(val expected: Long, val actual: Long) : CommandResult()
     data class ValidationError(val errors: List<String>) : CommandResult()
     data class NotFound(val message: String) : CommandResult()
@@ -20,6 +18,7 @@ sealed class CommandResult {
 
 class StoryboardCommandService(
     private val storyboardRepository: StoryboardRepository,
+    private val atomicWriteRepository: AtomicWriteRepository,
     private val eventLogRepository: EventLogRepository,
     private val knowledgePointValidator: KnowledgePointValidator,
     private val eventTopic: String = "storyboard-events"
@@ -45,19 +44,17 @@ class StoryboardCommandService(
         )
 
         return try {
-            val storyboard = Storyboard(
-                id = id,
+            val eventLogId = atomicWriteRepository.createStoryboardAtomically(
+                storyboardId = id.toUUID(),
                 externalId = externalId,
                 title = title,
                 currentVersion = version,
                 originalKnowledgePoints = originalKnowledgePoints,
-                segments = emptyList()
+                event = event,
+                topic = eventTopic
             )
-            storyboardRepository.create(storyboard)
-            eventLogRepository.append(event)
-            eventLogRepository.appendOutbox(event, eventTopic)
             logger.info { "Created storyboard ${id.value} (externalId=$externalId)" }
-            CommandResult.Success(id.value, version, event.eventId)
+            CommandResult.Success(id.value, version, event.eventId, eventLogId)
         } catch (e: Exception) {
             logger.error(e) { "Failed to create storyboard" }
             CommandResult.Error(e.message ?: "Unknown error")
@@ -74,28 +71,18 @@ class StoryboardCommandService(
         val errors = validateSegmentData(segment)
         if (errors.isNotEmpty()) return CommandResult.ValidationError(errors)
 
-        return try {
-            val newVersion = storyboardRepository.incrementVersion(sid, expectedVersion)
+        val timelineErrors = validateTimeline(sid, listOf(segment.startTimeMs to segment.endTimeMs))
+        if (timelineErrors.isNotEmpty()) return CommandResult.ValidationError(timelineErrors)
 
-            val event = SegmentAdded(
-                storyboardId = storyboardId,
-                aggregateVersion = newVersion,
-                segment = segment,
-                previousSegmentOrder = null
-            )
+        val newVersion = expectedVersion + 1
+        val event = SegmentAdded(
+            storyboardId = storyboardId,
+            aggregateVersion = newVersion,
+            segment = segment,
+            previousSegmentOrder = null
+        )
 
-            eventLogRepository.append(event)
-            eventLogRepository.appendOutbox(event, eventTopic)
-
-            logger.debug { "Added segment to $storyboardId at version $newVersion" }
-            CommandResult.Success(storyboardId, newVersion, event.eventId)
-        } catch (e: OptimisticLockException) {
-            val actual = storyboardRepository.getCurrentVersion(sid) ?: 0L
-            CommandResult.VersionConflict(expectedVersion, actual)
-        } catch (e: Exception) {
-            logger.error(e) { "Failed to add segment to $storyboardId" }
-            CommandResult.Error(e.message ?: "Unknown error")
-        }
+        return executeAtomically(storyboardId, expectedVersion, newVersion, event)
     }
 
     suspend fun updateSegment(
@@ -109,28 +96,20 @@ class StoryboardCommandService(
         val errors = validateChangeSet(changes)
         if (errors.isNotEmpty()) return CommandResult.ValidationError(errors)
 
-        return try {
-            val newVersion = storyboardRepository.incrementVersion(sid, expectedVersion)
+        val newVersion = expectedVersion + 1
+        val event = SegmentUpdated(
+            storyboardId = storyboardId,
+            aggregateVersion = newVersion,
+            segmentId = segmentId,
+            changes = changes
+        )
 
-            val event = SegmentUpdated(
-                storyboardId = storyboardId,
-                aggregateVersion = newVersion,
-                segmentId = segmentId,
-                changes = changes
-            )
-
-            eventLogRepository.append(event)
-            eventLogRepository.appendOutbox(event, eventTopic)
-
-            logger.debug { "Updated segment $segmentId in $storyboardId at version $newVersion" }
-            CommandResult.Success(storyboardId, newVersion, event.eventId)
-        } catch (e: OptimisticLockException) {
-            val actual = storyboardRepository.getCurrentVersion(sid) ?: 0L
-            CommandResult.VersionConflict(expectedVersion, actual)
-        } catch (e: Exception) {
-            logger.error(e) { "Failed to update segment $segmentId in $storyboardId" }
-            CommandResult.Error(e.message ?: "Unknown error")
+        if (changes.startTimeMs != null || changes.endTimeMs != null) {
+            val timelineErrors = validateTimeline(sid, null, UUID.fromString(segmentId))
+            if (timelineErrors.isNotEmpty()) return CommandResult.ValidationError(timelineErrors)
         }
+
+        return executeAtomically(storyboardId, expectedVersion, newVersion, event)
     }
 
     suspend fun deleteSegment(
@@ -138,30 +117,14 @@ class StoryboardCommandService(
         expectedVersion: Long,
         segmentId: String
     ): CommandResult {
-        val sid = StoryboardId(storyboardId)
-
-        return try {
-            val newVersion = storyboardRepository.incrementVersion(sid, expectedVersion)
-
-            val event = SegmentDeleted(
-                storyboardId = storyboardId,
-                aggregateVersion = newVersion,
-                segmentId = segmentId,
-                segmentOrder = 0
-            )
-
-            eventLogRepository.append(event)
-            eventLogRepository.appendOutbox(event, eventTopic)
-
-            logger.debug { "Deleted segment $segmentId from $storyboardId at version $newVersion" }
-            CommandResult.Success(storyboardId, newVersion, event.eventId)
-        } catch (e: OptimisticLockException) {
-            val actual = storyboardRepository.getCurrentVersion(sid) ?: 0L
-            CommandResult.VersionConflict(expectedVersion, actual)
-        } catch (e: Exception) {
-            logger.error(e) { "Failed to delete segment $segmentId from $storyboardId" }
-            CommandResult.Error(e.message ?: "Unknown error")
-        }
+        val newVersion = expectedVersion + 1
+        val event = SegmentDeleted(
+            storyboardId = storyboardId,
+            aggregateVersion = newVersion,
+            segmentId = segmentId,
+            segmentOrder = 0
+        )
+        return executeAtomically(storyboardId, expectedVersion, newVersion, event)
     }
 
     suspend fun reorderSegments(
@@ -169,33 +132,16 @@ class StoryboardCommandService(
         expectedVersion: Long,
         newOrder: List<String>
     ): CommandResult {
-        val sid = StoryboardId(storyboardId)
-
         if (newOrder.isEmpty()) {
             return CommandResult.ValidationError(listOf("newOrder must not be empty"))
         }
-
-        return try {
-            val newVersion = storyboardRepository.incrementVersion(sid, expectedVersion)
-
-            val event = SegmentsReordered(
-                storyboardId = storyboardId,
-                aggregateVersion = newVersion,
-                newOrder = newOrder
-            )
-
-            eventLogRepository.append(event)
-            eventLogRepository.appendOutbox(event, eventTopic)
-
-            logger.debug { "Reordered segments in $storyboardId at version $newVersion" }
-            CommandResult.Success(storyboardId, newVersion, event.eventId)
-        } catch (e: OptimisticLockException) {
-            val actual = storyboardRepository.getCurrentVersion(sid) ?: 0L
-            CommandResult.VersionConflict(expectedVersion, actual)
-        } catch (e: Exception) {
-            logger.error(e) { "Failed to reorder segments in $storyboardId" }
-            CommandResult.Error(e.message ?: "Unknown error")
-        }
+        val newVersion = expectedVersion + 1
+        val event = SegmentsReordered(
+            storyboardId = storyboardId,
+            aggregateVersion = newVersion,
+            newOrder = newOrder
+        )
+        return executeAtomically(storyboardId, expectedVersion, newVersion, event)
     }
 
     suspend fun batchImportSegments(
@@ -211,29 +157,16 @@ class StoryboardCommandService(
         }
         if (allErrors.isNotEmpty()) return CommandResult.ValidationError(allErrors)
 
-        return try {
-            val newVersion = storyboardRepository.incrementVersion(sid, expectedVersion)
+        val newVersion = expectedVersion + 1
+        val event = SegmentsBatchImported(
+            storyboardId = storyboardId,
+            aggregateVersion = newVersion,
+            importJobId = importJobId,
+            segments = segments,
+            batchStartVersion = expectedVersion
+        )
 
-            val event = SegmentsBatchImported(
-                storyboardId = storyboardId,
-                aggregateVersion = newVersion,
-                importJobId = importJobId,
-                segments = segments,
-                batchStartVersion = expectedVersion
-            )
-
-            eventLogRepository.append(event)
-            eventLogRepository.appendOutbox(event, eventTopic)
-
-            logger.info { "Batch imported ${segments.size} segments to $storyboardId at version $newVersion" }
-            CommandResult.Success(storyboardId, newVersion, event.eventId)
-        } catch (e: OptimisticLockException) {
-            val actual = storyboardRepository.getCurrentVersion(sid) ?: 0L
-            CommandResult.VersionConflict(expectedVersion, actual)
-        } catch (e: Exception) {
-            logger.error(e) { "Failed to batch import to $storyboardId" }
-            CommandResult.Error(e.message ?: "Unknown error")
-        }
+        return executeAtomically(storyboardId, expectedVersion, newVersion, event)
     }
 
     suspend fun requestRebuild(storyboardId: String, reason: String): CommandResult {
@@ -241,16 +174,61 @@ class StoryboardCommandService(
         val currentVersion = storyboardRepository.getCurrentVersion(sid)
             ?: return CommandResult.NotFound("Storyboard not found: $storyboardId")
 
+        val newVersion = currentVersion + 1
         val event = ProjectionRebuildRequested(
             storyboardId = storyboardId,
-            aggregateVersion = currentVersion + 1,
+            aggregateVersion = newVersion,
             reason = reason
         )
 
-        eventLogRepository.append(event)
-        eventLogRepository.appendOutbox(event, eventTopic)
+        return try {
+            val eventLogId = atomicWriteRepository.appendEventAndOutboxAtomically(event, eventTopic)
+            CommandResult.Success(storyboardId, newVersion, event.eventId, eventLogId)
+        } catch (e: Exception) {
+            logger.error(e) { "Failed to request rebuild" }
+            CommandResult.Error(e.message ?: "Unknown error")
+        }
+    }
 
-        return CommandResult.Success(storyboardId, currentVersion + 1, event.eventId)
+    private suspend fun executeAtomically(
+        storyboardId: String,
+        expectedVersion: Long,
+        newVersion: Long,
+        event: DomainEvent
+    ): CommandResult {
+        return try {
+            val eventLogId = atomicWriteRepository.appendEventAndOutboxAtomically(
+                event = event,
+                topic = eventTopic,
+                expectedVersion = expectedVersion,
+                storyboardIdForVersion = storyboardId
+            )
+            logger.debug { "Atomically wrote event ${event.eventType} v$newVersion for $storyboardId" }
+            CommandResult.Success(storyboardId, newVersion, event.eventId, eventLogId)
+        } catch (e: OptimisticLockException) {
+            val actual = storyboardRepository.getCurrentVersion(StoryboardId(storyboardId)) ?: 0L
+            CommandResult.VersionConflict(expectedVersion, actual)
+        } catch (e: Exception) {
+            logger.error(e) { "Failed to execute command for $storyboardId" }
+            CommandResult.Error(e.message ?: "Unknown error")
+        }
+    }
+
+    private suspend fun validateTimeline(
+        storyboardId: StoryboardId,
+        newSegments: List<Pair<Long, Long>>? = null,
+        excludeSegmentId: UUID? = null
+    ): List<String> {
+        val result = atomicWriteRepository.validateTimelineContinuous(
+            storyboardId.toUUID(),
+            newSegments,
+            excludeSegmentId
+        )
+        val errors = mutableListOf<String>()
+        if (result.hasOverlaps) {
+            errors.add("Timeline has overlapping segments: ${result.overlappingPairs.size} overlap(s) detected")
+        }
+        return errors
     }
 
     private fun validateSegmentData(segment: SegmentData): List<String> {

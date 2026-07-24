@@ -76,10 +76,10 @@ class Dependencies private constructor(
     val dbFactory: DatabaseFactory,
     val storyboardRepository: StoryboardRepository,
     val eventLogRepository: EventLogRepository,
+    val atomicWriteRepository: AtomicWriteRepository,
     val projectionRepository: RiskProjectionRepository,
     val deadLetterRepository: DeadLetterRepository,
     val importRepository: ImportRepository,
-    val consumerOffsetRepository: ConsumerOffsetRepository,
     val commandService: StoryboardCommandService,
     val queryService: StoryboardQueryService,
     val analysisEngine: RiskAnalysisEngine,
@@ -130,10 +130,10 @@ class Dependencies private constructor(
 
             val storyboardRepo = StoryboardRepository()
             val eventLogRepo = EventLogRepository()
+            val atomicWriteRepo = AtomicWriteRepository()
             val projectionRepo = RiskProjectionRepository()
             val deadLetterRepo = DeadLetterRepository()
             val importRepo = ImportRepository()
-            val consumerOffsetRepo = ConsumerOffsetRepository()
 
             val analysisConfig = RiskRuleConfig(
                 ruleVersion = config.property("analysis.ruleVersion").getString(),
@@ -147,13 +147,12 @@ class Dependencies private constructor(
 
             val analysisEngine = RiskAnalysisEngine(analysisConfig, storyboardRepo, projectionRepo)
             val kpValidator = KnowledgePointValidator(storyboardRepo)
-            val eventProcessor = EventProcessor(storyboardRepo, eventLogRepo, projectionRepo, analysisEngine, kpValidator, analysisConfig)
+            val eventProcessor = EventProcessor(storyboardRepo, atomicWriteRepo, projectionRepo, analysisEngine, kpValidator, analysisConfig)
 
             val redpandaConfig = config.config("redpanda")
             val bootstrapServers = redpandaConfig.property("bootstrapServers").getString()
             val consumerGroupId = redpandaConfig.property("consumerGroupId").getString()
             val topicEvents = redpandaConfig.property("topicEvents").getString()
-            val topicDeadLetter = redpandaConfig.property("topicDeadLetter").getString()
 
             val producerFactory = KafkaProducerFactory(bootstrapServers)
             val consumerFactory = KafkaConsumerFactory(bootstrapServers, consumerGroupId)
@@ -161,13 +160,14 @@ class Dependencies private constructor(
 
             val importBatchSize = config.property("import.batchSize").getString().toInt()
             val maxConcurrent = config.property("import.maxConcurrentJobs").getString().toInt()
-            val importService = StreamingImportService(storyboardRepo, eventLogRepo, importRepo, eventProcessor, importBatchSize, maxConcurrent)
+            val importService = StreamingImportService(storyboardRepo, atomicWriteRepo, importRepo, eventProcessor, importBatchSize, maxConcurrent, topicEvents)
 
             val eventConsumer = EventConsumer(
                 consumerFactory = consumerFactory,
-                offsetRepository = consumerOffsetRepo,
+                atomicWriteRepository = atomicWriteRepo,
                 deadLetterRepository = deadLetterRepo,
                 topics = listOf(topicEvents),
+                consumerGroupId = consumerGroupId,
                 handler = DomainEventHandler { event -> eventProcessor.processEvent(event) }
             )
 
@@ -175,26 +175,27 @@ class Dependencies private constructor(
                 deadLetterRepository = deadLetterRepo,
                 eventProcessor = eventProcessor,
                 producerFactory = producerFactory,
-                topic = topicEvents
+                topic = topicEvents,
+                consumerGroupId = consumerGroupId
             )
 
             val driftCheckInterval = config.property("analysis.driftCheckIntervalSeconds").getString().toLong()
             val workerPoolSize = config.property("analysis.workerPoolSize").getString().toInt()
             val workerScope = CoroutineScope(Executors.newFixedThreadPool(workerPoolSize).asCoroutineDispatcher() + SupervisorJob())
 
-            val driftChecker = ProjectionDriftChecker(projectionRepo, storyboardRepo, analysisEngine, eventProcessor)
+            val driftChecker = ProjectionDriftChecker(projectionRepo, storyboardRepo, analysisEngine, eventProcessor, atomicWriteRepo)
 
-            val commandService = StoryboardCommandService(storyboardRepo, eventLogRepo, kpValidator, topicEvents)
+            val commandService = StoryboardCommandService(storyboardRepo, atomicWriteRepo, eventLogRepo, kpValidator, topicEvents)
             val queryService = StoryboardQueryService(storyboardRepo, projectionRepo, analysisEngine, kpValidator)
 
             return Dependencies(
                 dbFactory = dbFactory,
                 storyboardRepository = storyboardRepo,
                 eventLogRepository = eventLogRepo,
+                atomicWriteRepository = atomicWriteRepo,
                 projectionRepository = projectionRepo,
                 deadLetterRepository = deadLetterRepo,
                 importRepository = importRepo,
-                consumerOffsetRepository = consumerOffsetRepo,
                 commandService = commandService,
                 queryService = queryService,
                 analysisEngine = analysisEngine,

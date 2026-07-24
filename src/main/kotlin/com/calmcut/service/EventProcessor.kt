@@ -4,25 +4,30 @@ import com.calmcut.domain.*
 import com.calmcut.domain.events.*
 import com.calmcut.domain.rules.RiskRuleConfig
 import com.calmcut.infrastructure.messaging.MessageHandlerResult
-import com.calmcut.infrastructure.repository.EventLogRepository
+import com.calmcut.infrastructure.repository.AtomicWriteRepository
 import com.calmcut.infrastructure.repository.RiskProjectionRepository
 import com.calmcut.infrastructure.repository.StoryboardRepository
 import mu.KotlinLogging
-import java.util.UUID
 
 private val logger = KotlinLogging.logger {}
 
 class EventProcessor(
     private val storyboardRepository: StoryboardRepository,
-    private val eventLogRepository: EventLogRepository,
+    private val atomicWriteRepository: AtomicWriteRepository,
     private val projectionRepository: RiskProjectionRepository,
     private val analysisEngine: RiskAnalysisEngine,
     private val knowledgePointValidator: KnowledgePointValidator,
     private val ruleConfig: RiskRuleConfig
 ) {
-    suspend fun processEvent(event: DomainEvent): MessageHandlerResult {
+    suspend fun processEvent(event: DomainEvent, consumerGroup: String = "storyboard-risk-worker"): MessageHandlerResult {
         return try {
             val storyboardId = StoryboardId(event.storyboardId)
+
+            val alreadyProcessed = atomicWriteRepository.getProcessedVersion(consumerGroup, event.storyboardId)
+            if (event.aggregateVersion <= alreadyProcessed) {
+                logger.debug { "Event ${event.eventId} v${event.aggregateVersion} already processed (last=$alreadyProcessed), skipping" }
+                return MessageHandlerResult(success = true, processedVersion = event.aggregateVersion)
+            }
 
             when (event) {
                 is StoryboardCreated -> handleStoryboardCreated(event)
@@ -47,8 +52,7 @@ class EventProcessor(
                 }
             }
 
-            eventLogRepository.append(event)
-            eventLogRepository.markProcessed(0)
+            atomicWriteRepository.saveProcessedVersion(consumerGroup, event.storyboardId, event.aggregateVersion)
 
             MessageHandlerResult(
                 success = true,
@@ -96,9 +100,7 @@ class EventProcessor(
 
         val kpCount = segments.count { it.isKnowledgePoint }
         storyboardRepository.updateKnowledgePointCount(storyboardId, kpCount)
-
         knowledgePointValidator.validateKnowledgePointIntegrity(storyboardId)
-
         analysisEngine.analyzeIncremental(storyboardId, event.aggregateVersion, event)
     }
 
@@ -125,7 +127,6 @@ class EventProcessor(
             storyboardRepository.updateKnowledgePointCount(storyboardId, segments.count { it.isKnowledgePoint })
             knowledgePointValidator.validateKnowledgePointIntegrity(storyboardId)
         }
-
         analysisEngine.analyzeIncremental(storyboardId, event.aggregateVersion, event)
     }
 
@@ -138,7 +139,6 @@ class EventProcessor(
             storyboardRepository.updateKnowledgePointCount(storyboardId, segments.count { it.isKnowledgePoint })
             knowledgePointValidator.validateKnowledgePointIntegrity(storyboardId)
         }
-
         analysisEngine.analyzeIncremental(storyboardId, event.aggregateVersion, event)
     }
 
@@ -149,7 +149,6 @@ class EventProcessor(
         val segments = storyboardRepository.getSegments(storyboardId)
         storyboardRepository.updateKnowledgePointCount(storyboardId, segments.count { it.isKnowledgePoint })
         knowledgePointValidator.validateKnowledgePointIntegrity(storyboardId)
-
         analysisEngine.analyzeFull(storyboardId, event.aggregateVersion)
     }
 
@@ -160,7 +159,7 @@ class EventProcessor(
 
     suspend fun rebuildProjectionFromScratch(storyboardId: StoryboardId): RiskAnalysisResult {
         projectionRepository.deleteProjection(storyboardId)
-        val version = eventLogRepository.getLatestVersion(storyboardId.value)
+        val version = atomicWriteRepository.getProcessedVersion("storyboard-risk-worker", storyboardId.value)
         return analysisEngine.analyzeFull(storyboardId, version)
     }
 }

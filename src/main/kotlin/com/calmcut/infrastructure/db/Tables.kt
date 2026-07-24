@@ -146,3 +146,24 @@ object ProjectionDriftCheckpoints : LongIdTable("projection_drift_checkpoints") 
     val driftDetails = text("drift_details").nullable()
     val checkedAt = timestamp("checked_at")
 }
+
+object ConsumerProcessedOffsets : Table("consumer_processed_offsets") {
+    val consumerGroup = varchar("consumer_group", 255)
+    val topic = varchar("topic", 255)
+    val partition = integer("partition")
+    val offsetVal = long("offset_val")
+    val eventId = uuid("event_id").nullable()
+    val eventType = varchar("event_type", 64).nullable()
+    val storyboardId = uuid("storyboard_id").nullable()
+    val processedAt = timestamp("processed_at")
+    override val primaryKey = PrimaryKey(consumerGroup, topic, partition, offsetVal)
+}
+
+object ConsumerStoryboardVersions : Table("consumer_storyboard_versions") {
+    val consumerGroup = varchar("consumer_group", 255)
+    val storyboardId = uuid("storyboard_id")
+    val lastProcessedVersion = long("last_processed_version").default(0)
+    val processedEventIds = text("processed_event_ids").default("{}")
+    val updatedAt = timestamp("updated_at")
+    override val primaryKey = PrimaryKey(consumerGroup, storyboardId)
+}

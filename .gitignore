@@ -1,6 +1,7 @@
 node_modules/
 dist/
 build/
+.gradle/
 coverage/
 .venv/
 venv/
@@ -14,4 +15,3 @@ __pycache__/
 .DS_Store
 playwright-report/
 test-results/
-

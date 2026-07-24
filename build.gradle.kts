@@ -52,6 +52,9 @@ dependencies {
     testImplementation("org.jetbrains.kotlin:kotlin-test-junit5:2.0.20")
     testImplementation("org.junit.jupiter:junit-jupiter:5.10.3")
     testImplementation("io.mockk:mockk:1.13.12")
+    testImplementation("org.testcontainers:postgresql:1.19.8")
+    testImplementation("org.testcontainers:kafka:1.19.8")
+    testImplementation("org.testcontainers:junit-jupiter:1.19.8")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 }
 
